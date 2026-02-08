@@ -4,12 +4,19 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
+from datetime import date, datetime
+
 import keyboards as kb
 from database import (
     is_admin, get_admins, add_admin, remove_admin,
     get_faq, get_faq_by_id, add_faq, remove_faq,
     generate_ref_token, use_ref_token,
-    set_user_in_support, is_user_in_support
+    set_user_in_support, is_user_in_support,
+    get_objects_by_category, get_object_by_id, get_all_objects_admin,
+    get_bookings_for_object_month, get_day_status, create_booking,
+    confirm_booking, reject_booking, cancel_booking,
+    get_booking_by_id, get_pending_bookings,
+    update_object,
 )
 from config import MAIN_ADMIN_ID
 
@@ -23,6 +30,11 @@ class AdminStates(StatesGroup):
 
 class UserStates(StatesGroup):
     in_support = State()
+
+class BookingStates(StatesGroup):
+    entering_name = State()
+    entering_phone = State()
+    confirming = State()
 
 # === Стартовые команды ===
 
@@ -441,5 +453,493 @@ async def callback_admin_create_ref(callback: CallbackQuery):
         "Отправьте эту ссылку человеку, которого хотите сделать админом.\n"
         "⚠️ Ссылка одноразовая.",
         reply_markup=kb.get_admin_keyboard(),
+        parse_mode="HTML"
+    )
+
+# === Бронирование (пользователь) ===
+
+@router.callback_query(F.data == "booking")
+async def callback_booking_start(callback: CallbackQuery, state: FSMContext):
+    """Бронирование: выбор категории"""
+    await state.clear()
+    await callback.message.edit_text(
+        "📅 <b>Бронирование</b>\n\nВыберите категорию:",
+        reply_markup=kb.get_booking_categories_keyboard(),
+        parse_mode="HTML"
+    )
+
+@router.callback_query(F.data == "book_back_categories")
+async def callback_book_back_categories(callback: CallbackQuery, state: FSMContext):
+    """Назад к категориям"""
+    await state.clear()
+    await callback.message.edit_text(
+        "📅 <b>Бронирование</b>\n\nВыберите категорию:",
+        reply_markup=kb.get_booking_categories_keyboard(),
+        parse_mode="HTML"
+    )
+
+@router.callback_query(F.data.startswith("book_cat_"))
+async def callback_booking_category(callback: CallbackQuery, state: FSMContext):
+    """Бронирование: список объектов в категории"""
+    category = callback.data.replace("book_cat_", "")
+    objects = get_objects_by_category(category)
+
+    category_names = {
+        "gazebo_fishing": "🎣 Беседки (рыбалка)",
+        "gazebo_recreation": "🏖 Беседки (отдых)",
+        "house": "🏠 Домики",
+    }
+
+    if not objects:
+        await callback.answer("Нет доступных объектов в этой категории", show_alert=True)
+        return
+
+    await state.update_data(booking_category=category)
+    await callback.message.edit_text(
+        f"📅 <b>{category_names.get(category, 'Бронирование')}</b>\n\nВыберите объект:",
+        reply_markup=kb.get_booking_objects_keyboard(objects, category),
+        parse_mode="HTML"
+    )
+
+@router.callback_query(F.data.startswith("book_obj_"))
+async def callback_booking_object(callback: CallbackQuery, state: FSMContext):
+    """Бронирование: показ календаря для объекта"""
+    object_id = int(callback.data.replace("book_obj_", ""))
+    obj = get_object_by_id(object_id)
+    if not obj:
+        await callback.answer("Объект не найден", show_alert=True)
+        return
+
+    today = date.today()
+    year, month = today.year, today.month
+    bookings = get_bookings_for_object_month(object_id, year, month)
+
+    await state.update_data(booking_object_id=object_id, booking_category=obj['category'])
+
+    price_text = f"{obj['price_weekday']}₽/день"
+    if obj['price_weekday'] != obj['price_weekend']:
+        price_text = f"{obj['price_weekday']}₽ будни / {obj['price_weekend']}₽ выходные"
+
+    await callback.message.edit_text(
+        f"📅 <b>{obj['name']}</b>\n"
+        f"👥 До {obj['capacity']} человек | {price_text}\n\n"
+        "Выберите дату:",
+        reply_markup=kb.get_booking_calendar_keyboard(object_id, year, month, bookings),
+        parse_mode="HTML"
+    )
+
+@router.callback_query(F.data.startswith("book_cal_"))
+async def callback_booking_calendar_nav(callback: CallbackQuery, state: FSMContext):
+    """Бронирование: навигация по месяцам"""
+    parts = callback.data.split("_")  # book_cal_{id}_{year}_{month}
+    object_id = int(parts[2])
+    year = int(parts[3])
+    month = int(parts[4])
+
+    obj = get_object_by_id(object_id)
+    if not obj:
+        await callback.answer("Объект не найден", show_alert=True)
+        return
+
+    bookings = get_bookings_for_object_month(object_id, year, month)
+
+    price_text = f"{obj['price_weekday']}₽/день"
+    if obj['price_weekday'] != obj['price_weekend']:
+        price_text = f"{obj['price_weekday']}₽ будни / {obj['price_weekend']}₽ выходные"
+
+    await callback.message.edit_text(
+        f"📅 <b>{obj['name']}</b>\n"
+        f"👥 До {obj['capacity']} человек | {price_text}\n\n"
+        "Выберите дату:",
+        reply_markup=kb.get_booking_calendar_keyboard(object_id, year, month, bookings),
+        parse_mode="HTML"
+    )
+
+@router.callback_query(F.data == "book_back_objects")
+async def callback_book_back_objects(callback: CallbackQuery, state: FSMContext):
+    """Назад к списку объектов"""
+    state_data = await state.get_data()
+    category = state_data.get("booking_category", "gazebo_fishing")
+    objects = get_objects_by_category(category)
+
+    category_names = {
+        "gazebo_fishing": "🎣 Беседки (рыбалка)",
+        "gazebo_recreation": "🏖 Беседки (отдых)",
+        "house": "🏠 Домики",
+    }
+
+    await callback.message.edit_text(
+        f"📅 <b>{category_names.get(category, 'Бронирование')}</b>\n\nВыберите объект:",
+        reply_markup=kb.get_booking_objects_keyboard(objects, category),
+        parse_mode="HTML"
+    )
+
+@router.callback_query(F.data.startswith("book_day_"))
+async def callback_booking_select_date(callback: CallbackQuery, state: FSMContext):
+    """Бронирование: дата выбрана, запрос имени"""
+    parts = callback.data.split("_")  # book_day_{id}_{YYYY-MM-DD}
+    object_id = int(parts[2])
+    date_str = parts[3]  # "YYYY-MM-DD"
+
+    # Проверяем доступность
+    status = get_day_status(object_id, date_str)
+    if status != 'available':
+        await callback.answer("Эта дата уже занята!", show_alert=True)
+        return
+
+    obj = get_object_by_id(object_id)
+    await state.update_data(
+        booking_object_id=object_id,
+        booking_date=date_str,
+        booking_object_name=obj['name'] if obj else "?"
+    )
+    await state.set_state(BookingStates.entering_name)
+
+    await callback.message.edit_text(
+        f"📅 <b>Бронирование: {obj['name']}</b>\n"
+        f"📆 Дата: {date_str}\n\n"
+        "Введите ваше имя:",
+        reply_markup=kb.get_booking_cancel_keyboard(),
+        parse_mode="HTML"
+    )
+
+@router.message(BookingStates.entering_name)
+async def handle_booking_name(message: Message, state: FSMContext):
+    """Бронирование: имя введено, запрос телефона"""
+    name = message.text.strip()
+    if len(name) < 2 or len(name) > 100:
+        await message.answer("Пожалуйста, введите корректное имя (от 2 до 100 символов):")
+        return
+
+    await state.update_data(booking_user_name=name)
+    await state.set_state(BookingStates.entering_phone)
+
+    await message.answer(
+        f"👤 Имя: {name}\n\n"
+        "Введите номер телефона:",
+        reply_markup=kb.get_booking_cancel_keyboard()
+    )
+
+@router.message(BookingStates.entering_phone)
+async def handle_booking_phone(message: Message, state: FSMContext):
+    """Бронирование: телефон введён, показ подтверждения"""
+    phone = message.text.strip()
+    digits = ''.join(c for c in phone if c.isdigit())
+    if len(digits) < 7:
+        await message.answer("Пожалуйста, введите корректный номер телефона:")
+        return
+
+    await state.update_data(booking_user_phone=phone)
+    state_data = await state.get_data()
+
+    obj = get_object_by_id(state_data['booking_object_id'])
+    date_obj = datetime.strptime(state_data['booking_date'], '%Y-%m-%d').date()
+
+    # Считаем цену
+    is_weekend = date_obj.weekday() >= 5
+    price = obj['price_weekend'] if is_weekend else obj['price_weekday']
+
+    await state.set_state(BookingStates.confirming)
+
+    await message.answer(
+        "📋 <b>Подтверждение бронирования</b>\n\n"
+        f"🏠 Объект: {state_data['booking_object_name']}\n"
+        f"📆 Дата: {state_data['booking_date']}\n"
+        f"💰 Стоимость: {price}₽\n"
+        f"👤 Имя: {state_data['booking_user_name']}\n"
+        f"📱 Телефон: {phone}\n\n"
+        "Всё верно?",
+        reply_markup=kb.get_booking_confirm_keyboard(),
+        parse_mode="HTML"
+    )
+
+@router.callback_query(F.data == "book_confirm", BookingStates.confirming)
+async def callback_booking_confirm(callback: CallbackQuery, state: FSMContext):
+    """Бронирование: подтверждение, создание заявки"""
+    state_data = await state.get_data()
+
+    booking_id = create_booking(
+        object_id=state_data['booking_object_id'],
+        date_str=state_data['booking_date'],
+        user_id=callback.from_user.id,
+        user_name=state_data['booking_user_name'],
+        user_phone=state_data['booking_user_phone'],
+    )
+
+    if booking_id is None:
+        await callback.message.edit_text(
+            "❌ К сожалению, эта дата уже занята.\n"
+            "Попробуйте выбрать другую дату.",
+            reply_markup=kb.get_booking_categories_keyboard()
+        )
+        await state.clear()
+        return
+
+    await state.clear()
+
+    await callback.message.edit_text(
+        "✅ <b>Заявка отправлена!</b>\n\n"
+        f"Номер брони: #{booking_id}\n"
+        f"🏠 {state_data['booking_object_name']}\n"
+        f"📆 {state_data['booking_date']}\n\n"
+        "Ожидайте подтверждения от администратора.\n"
+        "Мы уведомим вас о решении.",
+        reply_markup=kb.get_main_keyboard(is_admin(callback.from_user.id)),
+        parse_mode="HTML"
+    )
+
+    # Уведомляем админов
+    admins = get_admins()
+    admin_text = (
+        "🔔 <b>Новая заявка на бронирование!</b>\n\n"
+        f"#{booking_id}\n"
+        f"🏠 {state_data['booking_object_name']}\n"
+        f"📆 {state_data['booking_date']}\n"
+        f"👤 {state_data['booking_user_name']}\n"
+        f"📱 {state_data['booking_user_phone']}\n"
+        f"Telegram ID: <code>{callback.from_user.id}</code>"
+    )
+    for admin_id in admins:
+        try:
+            await callback.bot.send_message(
+                admin_id,
+                admin_text,
+                reply_markup=kb.get_admin_booking_detail_keyboard(booking_id, 'pending'),
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            print(f"Не удалось уведомить админа {admin_id}: {e}")
+
+@router.callback_query(F.data == "book_cancel")
+async def callback_booking_cancel(callback: CallbackQuery, state: FSMContext):
+    """Отмена бронирования"""
+    await state.clear()
+    await callback.message.edit_text(
+        "❌ Бронирование отменено.\n\n"
+        "Вы можете начать заново из главного меню.",
+        reply_markup=kb.get_main_keyboard(is_admin(callback.from_user.id))
+    )
+
+# === Админ: Управление бронированиями ===
+
+@router.callback_query(F.data == "admin_bookings")
+async def callback_admin_bookings(callback: CallbackQuery):
+    """Меню управления бронированиями"""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Нет доступа", show_alert=True)
+        return
+    await callback.message.edit_text(
+        "📅 <b>Управление бронированиями</b>",
+        reply_markup=kb.get_admin_bookings_keyboard(),
+        parse_mode="HTML"
+    )
+
+@router.callback_query(F.data == "admin_book_pending")
+async def callback_admin_book_pending(callback: CallbackQuery):
+    """Список ожидающих бронирований"""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Нет доступа", show_alert=True)
+        return
+    bookings = get_pending_bookings()
+    if not bookings:
+        await callback.message.edit_text(
+            "📅 Нет ожидающих заявок.",
+            reply_markup=kb.get_admin_bookings_keyboard()
+        )
+        return
+    await callback.message.edit_text(
+        f"⏳ <b>Ожидающие подтверждения ({len(bookings)})</b>",
+        reply_markup=kb.get_admin_pending_bookings_keyboard(bookings),
+        parse_mode="HTML"
+    )
+
+@router.callback_query(F.data.startswith("admin_book_detail_"))
+async def callback_admin_book_detail(callback: CallbackQuery):
+    """Детали бронирования"""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Нет доступа", show_alert=True)
+        return
+    booking_id = int(callback.data.replace("admin_book_detail_", ""))
+    booking = get_booking_by_id(booking_id)
+    if not booking:
+        await callback.answer("Бронирование не найдено", show_alert=True)
+        return
+
+    status_text = {"pending": "⏳ Ожидает", "confirmed": "✅ Подтверждено", "cancelled": "❌ Отменено"}
+    await callback.message.edit_text(
+        f"📋 <b>Бронирование #{booking['id']}</b>\n\n"
+        f"🏠 {booking['object_name']}\n"
+        f"📆 {booking['date']}\n"
+        f"👤 {booking['user_name']}\n"
+        f"📱 {booking['user_phone']}\n"
+        f"Telegram: <code>{booking['user_id']}</code>\n"
+        f"Статус: {status_text.get(booking['status'], booking['status'])}\n"
+        f"Создано: {booking['created_at']}",
+        reply_markup=kb.get_admin_booking_detail_keyboard(booking_id, booking['status']),
+        parse_mode="HTML"
+    )
+
+@router.callback_query(F.data.startswith("admin_book_confirm_"))
+async def callback_admin_book_confirm(callback: CallbackQuery):
+    """Подтвердить бронирование"""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Нет доступа", show_alert=True)
+        return
+    booking_id = int(callback.data.replace("admin_book_confirm_", ""))
+    booking = get_booking_by_id(booking_id)
+    if confirm_booking(booking_id, callback.from_user.id):
+        await callback.answer("✅ Бронирование подтверждено", show_alert=True)
+        # Обновляем детали
+        booking = get_booking_by_id(booking_id)
+        if booking:
+            status_text = {"pending": "⏳ Ожидает", "confirmed": "✅ Подтверждено", "cancelled": "❌ Отменено"}
+            await callback.message.edit_text(
+                f"📋 <b>Бронирование #{booking['id']}</b>\n\n"
+                f"🏠 {booking['object_name']}\n"
+                f"📆 {booking['date']}\n"
+                f"👤 {booking['user_name']}\n"
+                f"📱 {booking['user_phone']}\n"
+                f"Telegram: <code>{booking['user_id']}</code>\n"
+                f"Статус: {status_text.get(booking['status'], booking['status'])}\n"
+                f"Создано: {booking['created_at']}",
+                reply_markup=kb.get_admin_booking_detail_keyboard(booking_id, booking['status']),
+                parse_mode="HTML"
+            )
+            # Уведомляем пользователя
+            try:
+                await callback.bot.send_message(
+                    booking['user_id'],
+                    f"✅ <b>Ваше бронирование подтверждено!</b>\n\n"
+                    f"#{booking['id']}\n"
+                    f"🏠 {booking['object_name']}\n"
+                    f"📆 {booking['date']}\n\n"
+                    "Ждём вас!",
+                    parse_mode="HTML"
+                )
+            except Exception:
+                pass
+    else:
+        await callback.answer("❌ Не удалось подтвердить", show_alert=True)
+
+@router.callback_query(F.data.startswith("admin_book_reject_"))
+async def callback_admin_book_reject(callback: CallbackQuery):
+    """Отклонить бронирование"""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Нет доступа", show_alert=True)
+        return
+    booking_id = int(callback.data.replace("admin_book_reject_", ""))
+    booking = get_booking_by_id(booking_id)
+    if reject_booking(booking_id, callback.from_user.id):
+        await callback.answer("❌ Бронирование отклонено", show_alert=True)
+        # Возврат к списку ожидающих
+        bookings = get_pending_bookings()
+        if not bookings:
+            await callback.message.edit_text(
+                "📅 Нет ожидающих заявок.",
+                reply_markup=kb.get_admin_bookings_keyboard()
+            )
+        else:
+            await callback.message.edit_text(
+                f"⏳ <b>Ожидающие подтверждения ({len(bookings)})</b>",
+                reply_markup=kb.get_admin_pending_bookings_keyboard(bookings),
+                parse_mode="HTML"
+            )
+        # Уведомляем пользователя
+        if booking:
+            try:
+                await callback.bot.send_message(
+                    booking['user_id'],
+                    f"❌ <b>Ваше бронирование отклонено</b>\n\n"
+                    f"#{booking['id']}\n"
+                    f"🏠 {booking['object_name']}\n"
+                    f"📆 {booking['date']}\n\n"
+                    "Свяжитесь с поддержкой для уточнения.",
+                    parse_mode="HTML"
+                )
+            except Exception:
+                pass
+    else:
+        await callback.answer("❌ Ошибка", show_alert=True)
+
+@router.callback_query(F.data.startswith("admin_book_cancel_"))
+async def callback_admin_book_cancel(callback: CallbackQuery):
+    """Отменить подтверждённое бронирование"""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Нет доступа", show_alert=True)
+        return
+    booking_id = int(callback.data.replace("admin_book_cancel_", ""))
+    booking = get_booking_by_id(booking_id)
+    if cancel_booking(booking_id, callback.from_user.id):
+        await callback.answer("🚫 Бронирование отменено", show_alert=True)
+        # Обновляем детали
+        booking = get_booking_by_id(booking_id)
+        if booking:
+            status_text = {"pending": "⏳ Ожидает", "confirmed": "✅ Подтверждено", "cancelled": "❌ Отменено"}
+            await callback.message.edit_text(
+                f"📋 <b>Бронирование #{booking['id']}</b>\n\n"
+                f"🏠 {booking['object_name']}\n"
+                f"📆 {booking['date']}\n"
+                f"👤 {booking['user_name']}\n"
+                f"📱 {booking['user_phone']}\n"
+                f"Telegram: <code>{booking['user_id']}</code>\n"
+                f"Статус: {status_text.get(booking['status'], booking['status'])}\n"
+                f"Создано: {booking['created_at']}",
+                reply_markup=kb.get_admin_booking_detail_keyboard(booking_id, booking['status']),
+                parse_mode="HTML"
+            )
+        # Уведомляем пользователя
+        if booking:
+            try:
+                await callback.bot.send_message(
+                    booking['user_id'],
+                    f"🚫 <b>Ваше бронирование отменено администратором</b>\n\n"
+                    f"#{booking['id']}\n"
+                    f"🏠 {booking['object_name']}\n"
+                    f"📆 {booking['date']}\n\n"
+                    "Свяжитесь с поддержкой для уточнения.",
+                    parse_mode="HTML"
+                )
+            except Exception:
+                pass
+    else:
+        await callback.answer("❌ Ошибка", show_alert=True)
+
+# === Админ: Управление объектами ===
+
+@router.callback_query(F.data == "admin_objects")
+async def callback_admin_objects(callback: CallbackQuery):
+    """Список объектов для управления"""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Нет доступа", show_alert=True)
+        return
+    objects = get_all_objects_admin()
+    await callback.message.edit_text(
+        "🔧 <b>Управление объектами</b>\n\n"
+        "🟢 активен | 🔴 отключён\n"
+        "Нажмите для переключения:",
+        reply_markup=kb.get_admin_objects_keyboard(objects),
+        parse_mode="HTML"
+    )
+
+@router.callback_query(F.data.startswith("admin_obj_toggle_"))
+async def callback_admin_obj_toggle(callback: CallbackQuery):
+    """Включить/отключить объект"""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Нет доступа", show_alert=True)
+        return
+    object_id = int(callback.data.replace("admin_obj_toggle_", ""))
+    obj = get_object_by_id(object_id)
+    if obj:
+        new_status = 0 if obj['is_active'] else 1
+        update_object(object_id, is_active=new_status)
+        status_text = "включён" if new_status else "отключён"
+        await callback.answer(f"Объект {status_text}", show_alert=True)
+    # Обновляем список
+    objects = get_all_objects_admin()
+    await callback.message.edit_text(
+        "🔧 <b>Управление объектами</b>\n\n"
+        "🟢 активен | 🔴 отключён\n"
+        "Нажмите для переключения:",
+        reply_markup=kb.get_admin_objects_keyboard(objects),
         parse_mode="HTML"
     )
