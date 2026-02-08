@@ -153,10 +153,19 @@ def init_db():
             ("Домик №1", "house", 4, 6000, 7000, "", 1, 20),
             ("Домик №2", "house", 4, 6000, 7000, "", 1, 21),
             ("Домик №3", "house", 4, 6000, 7000, "", 1, 22),
+            ("Домик №4", "house", 4, 6000, 7000, "", 1, 23),
         ]
         cursor.executemany(
             'INSERT INTO objects (name, category, capacity, price_weekday, price_weekend, description, is_active, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
             default_objects
+        )
+
+    # Миграция: гарантируем наличие Домик №4 в уже существующих БД
+    cursor.execute('SELECT id FROM objects WHERE name = ?', ("Домик №4",))
+    if not cursor.fetchone():
+        cursor.execute(
+            'INSERT INTO objects (name, category, capacity, price_weekday, price_weekend, description, is_active, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+            ("Домик №4", "house", 4, 6000, 7000, "", 1, 23)
         )
 
     conn.commit()
