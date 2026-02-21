@@ -1,5 +1,6 @@
 ﻿import asyncio
 import logging
+import os
 from datetime import date
 
 from aiohttp import web
@@ -84,6 +85,13 @@ async def handle_options(request):
 
 async def start_api():
     """Запуск HTTP API сервера"""
+    port_str = os.getenv("PORT", "8080")
+    try:
+        port = int(port_str)
+    except ValueError:
+        logger.warning("Некорректный PORT=%s, используется 8080", port_str)
+        port = 8080
+
     app = web.Application()
     app.router.add_get('/api/objects', handle_objects)
     app.router.add_get('/api/calendar/{object_id}', handle_calendar)
@@ -92,9 +100,9 @@ async def start_api():
 
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', 8080)
+    site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
-    logger.info("🌐 HTTP API запущен на порту 8080")
+    logger.info("🌐 HTTP API запущен на порту %s", port)
 
 
 async def main():
