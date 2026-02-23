@@ -22,6 +22,24 @@ from config import MAIN_ADMIN_ID
 
 router = Router()
 
+# Категории и deep-link сценарии бронирования
+BOOKING_CATEGORY_NAMES = {
+    "gazebo_fishing": "🎣 Беседки (рыбалка)",
+    "gazebo_recreation": "🏖 Беседки (отдых)",
+    "house": "🏠 Домики",
+}
+
+SITE_START_CATEGORY_MAP = {
+    "fishing": "gazebo_fishing",
+    "recreation": "gazebo_recreation",
+    "house": "house",
+    "site_fishing": "gazebo_fishing",
+    "site_recreation": "gazebo_recreation",
+    "site_house": "house",
+    "gazebo_fishing": "gazebo_fishing",
+    "gazebo_recreation": "gazebo_recreation",
+}
+
 # === Состояния ===
 class AdminStates(StatesGroup):
     waiting_faq_question = State()
@@ -43,11 +61,37 @@ async def cmd_start(message: Message, state: FSMContext):
     """Обработка /start и реф-ссылок"""
     await state.clear()
 
-    # Проверяем реф-ссылку
-    args = message.text.split()
+    # /start аргумент, если есть
+    args = (message.text or "").split(maxsplit=1)
     if len(args) > 1:
-        token = args[1]
-        if use_ref_token(token, message.from_user.id):
+        start_arg = args[1].strip()
+        start_arg_normalized = start_arg.lower()
+
+        # Сначала обрабатываем deep-link сценарии с сайта
+        start_category = SITE_START_CATEGORY_MAP.get(start_arg_normalized)
+        if start_category:
+            objects = get_objects_by_category(start_category)
+            if not objects:
+                category_name = BOOKING_CATEGORY_NAMES.get(start_category, "выбранной категории")
+                await message.answer(
+                    f"📭 В <b>{category_name}</b> пока нет доступных объектов.\n\n"
+                    "Выберите другую категорию:",
+                    reply_markup=kb.get_booking_categories_keyboard(),
+                    parse_mode="HTML"
+                )
+                return
+
+            await state.update_data(booking_category=start_category)
+            await message.answer(
+                f"📅 <b>{BOOKING_CATEGORY_NAMES.get(start_category, 'Бронирование')}</b>\n\n"
+                "Выберите объект:",
+                reply_markup=kb.get_booking_objects_keyboard(objects, start_category),
+                parse_mode="HTML"
+            )
+            return
+
+        # Если это не сценарий сайта, проверяем админ-реф токен
+        if use_ref_token(start_arg, message.from_user.id):
             await message.answer(
                 "🎉 Поздравляем! Вы стали администратором бота.\n"
                 "Используйте /admin для доступа к панели управления."
@@ -484,19 +528,13 @@ async def callback_booking_category(callback: CallbackQuery, state: FSMContext):
     category = callback.data.replace("book_cat_", "")
     objects = get_objects_by_category(category)
 
-    category_names = {
-        "gazebo_fishing": "🎣 Беседки (рыбалка)",
-        "gazebo_recreation": "🏖 Беседки (отдых)",
-        "house": "🏠 Домики",
-    }
-
     if not objects:
         await callback.answer("Нет доступных объектов в этой категории", show_alert=True)
         return
 
     await state.update_data(booking_category=category)
     await callback.message.edit_text(
-        f"📅 <b>{category_names.get(category, 'Бронирование')}</b>\n\nВыберите объект:",
+        f"📅 <b>{BOOKING_CATEGORY_NAMES.get(category, 'Бронирование')}</b>\n\nВыберите объект:",
         reply_markup=kb.get_booking_objects_keyboard(objects, category),
         parse_mode="HTML"
     )
@@ -562,14 +600,8 @@ async def callback_book_back_objects(callback: CallbackQuery, state: FSMContext)
     category = state_data.get("booking_category", "gazebo_fishing")
     objects = get_objects_by_category(category)
 
-    category_names = {
-        "gazebo_fishing": "🎣 Беседки (рыбалка)",
-        "gazebo_recreation": "🏖 Беседки (отдых)",
-        "house": "🏠 Домики",
-    }
-
     await callback.message.edit_text(
-        f"📅 <b>{category_names.get(category, 'Бронирование')}</b>\n\nВыберите объект:",
+        f"📅 <b>{BOOKING_CATEGORY_NAMES.get(category, 'Бронирование')}</b>\n\nВыберите объект:",
         reply_markup=kb.get_booking_objects_keyboard(objects, category),
         parse_mode="HTML"
     )
