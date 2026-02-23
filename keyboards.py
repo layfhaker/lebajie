@@ -49,15 +49,21 @@ def get_back_keyboard():
 
 # === Админские клавиатуры ===
 
-def get_admin_keyboard():
+def get_admin_keyboard(is_tech_admin=False, notifications_enabled=True):
     """Админ-панель"""
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+    buttons = [
         [InlineKeyboardButton(text="📅 Бронирования", callback_data="admin_bookings")],
         [InlineKeyboardButton(text="📝 Изменить FAQ", callback_data="admin_faq")],
         [InlineKeyboardButton(text="🔗 Пригласить админа (реф-ссылка)", callback_data="admin_create_ref")],
         [InlineKeyboardButton(text="👥 Управление админами", callback_data="admin_admins")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_main")],
-    ])
+    ]
+
+    if is_tech_admin:
+        toggle_text = "🔕 Выключить уведомления" if notifications_enabled else "🔔 Включить уведомления"
+        buttons.append([InlineKeyboardButton(text=toggle_text, callback_data="admin_toggle_notifications")])
+
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_main")])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
     return keyboard
 
 def get_admin_faq_keyboard(faq_list):
@@ -74,11 +80,22 @@ def get_admin_faq_keyboard(faq_list):
     buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_panel")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
+
+def get_admin_faq_item_keyboard(faq_id):
+    """Меню редактирования одного FAQ-элемента"""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Изменить вопрос", callback_data=f"admin_faq_edit_q_{faq_id}")],
+        [InlineKeyboardButton(text="📝 Изменить ответ", callback_data=f"admin_faq_edit_a_{faq_id}")],
+        [InlineKeyboardButton(text="🗑 Удалить вопрос", callback_data=f"admin_faq_delete_{faq_id}")],
+        [InlineKeyboardButton(text="⬅️ К списку FAQ", callback_data="admin_faq")],
+    ])
+
+
 def get_admin_admins_keyboard(admins, main_admin_id):
     """Админское управление админами"""
     buttons = []
     for admin_id in admins:
-        is_main = " (главный)" if admin_id == main_admin_id else ""
+        is_main = " (админ-технарь)" if admin_id == main_admin_id else ""
         buttons.append([
             InlineKeyboardButton(text=f"👤 {admin_id}{is_main}", callback_data=f"admin_info_{admin_id}"),
             InlineKeyboardButton(text="🗑" if admin_id != main_admin_id else "⭐", callback_data=f"admin_remove_{admin_id}" if admin_id != main_admin_id else "noop")
@@ -142,9 +159,9 @@ def get_booking_calendar_keyboard(object_id, year, month, bookings):
     # Карта статусов: date_str -> status
     status_map = {}
     for b in bookings:
-        if b['status'] == 'confirmed':
+        if b['status'] in ('confirmed', 'blocked'):
             status_map[b['date']] = 'booked'
-        elif b['date'] not in status_map:
+        elif b['status'] == 'pending' and b['date'] not in status_map:
             status_map[b['date']] = 'pending'
 
     today = date.today()
@@ -286,7 +303,91 @@ def get_admin_objects_keyboard(objects):
         status_icon = "🟢" if obj['is_active'] else "🔴"
         text = f"{status_icon} {obj['name']}"
         buttons.append([
-            InlineKeyboardButton(text=text, callback_data=f"admin_obj_toggle_{obj['id']}")
+            InlineKeyboardButton(text=text, callback_data=f"admin_obj_open_{obj['id']}")
         ])
     buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_bookings")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def get_admin_object_calendar_keyboard(object_id, year, month, bookings, is_active):
+    """Календарь объекта для ручной блокировки дат в админке"""
+    status_map = {}
+    for b in bookings:
+        if b['status'] == 'confirmed':
+            status_map[b['date']] = 'confirmed'
+        elif b['status'] == 'pending' and status_map.get(b['date']) != 'confirmed':
+            status_map[b['date']] = 'pending'
+        elif b['status'] == 'blocked' and b['date'] not in status_map:
+            status_map[b['date']] = 'blocked'
+
+    today = date.today()
+    month_names = {
+        1: "Январь", 2: "Февраль", 3: "Март", 4: "Апрель",
+        5: "Май", 6: "Июнь", 7: "Июль", 8: "Август",
+        9: "Сентябрь", 10: "Октябрь", 11: "Ноябрь", 12: "Декабрь"
+    }
+    buttons = []
+
+    prev_month = month - 1 if month > 1 else 12
+    prev_year = year if month > 1 else year - 1
+    next_month = month + 1 if month < 12 else 1
+    next_year = year if month < 12 else year + 1
+
+    can_go_prev = date(prev_year, prev_month, 1) >= date(today.year, today.month, 1)
+    prev_btn = InlineKeyboardButton(
+        text="◀️" if can_go_prev else " ",
+        callback_data=f"admin_obj_cal_{object_id}_{prev_year}_{prev_month}" if can_go_prev else "noop"
+    )
+    next_btn = InlineKeyboardButton(
+        text="▶️",
+        callback_data=f"admin_obj_cal_{object_id}_{next_year}_{next_month}"
+    )
+    header_btn = InlineKeyboardButton(
+        text=f"{month_names[month]} {year}",
+        callback_data="noop"
+    )
+    buttons.append([prev_btn, header_btn, next_btn])
+
+    week_headers = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+    buttons.append([InlineKeyboardButton(text=d, callback_data="noop") for d in week_headers])
+
+    cal = cal_module.monthcalendar(year, month)
+    for week in cal:
+        row = []
+        for day_num in week:
+            if day_num == 0:
+                row.append(InlineKeyboardButton(text=" ", callback_data="noop"))
+                continue
+
+            date_str = f"{year:04d}-{month:02d}-{day_num:02d}"
+            day_date = date(year, month, day_num)
+            status = status_map.get(date_str, 'available')
+
+            if day_date < today:
+                row.append(InlineKeyboardButton(text=f"{day_num}", callback_data="noop"))
+                continue
+
+            if status == 'confirmed':
+                row.append(InlineKeyboardButton(text=f"❌{day_num}", callback_data="noop"))
+            elif status == 'pending':
+                row.append(InlineKeyboardButton(text=f"⏳{day_num}", callback_data="noop"))
+            elif status == 'blocked':
+                row.append(InlineKeyboardButton(text=f"🚫{day_num}", callback_data=f"admin_obj_day_{object_id}_{date_str}"))
+            else:
+                row.append(InlineKeyboardButton(text=f"✅{day_num}", callback_data=f"admin_obj_day_{object_id}_{date_str}"))
+        buttons.append(row)
+
+    buttons.append([
+        InlineKeyboardButton(text="✅свободно", callback_data="noop"),
+        InlineKeyboardButton(text="🚫вручную", callback_data="noop"),
+        InlineKeyboardButton(text="⏳ожидание", callback_data="noop"),
+        InlineKeyboardButton(text="❌бронь", callback_data="noop"),
+    ])
+
+    active_btn_text = "🔴 Отключить объект" if is_active else "🟢 Включить объект"
+    buttons.append([
+        InlineKeyboardButton(text=active_btn_text, callback_data=f"admin_obj_active_{object_id}_{year}_{month}")
+    ])
+    buttons.append([InlineKeyboardButton(text="⬅️ К объектам", callback_data="admin_objects")])
+
     return InlineKeyboardMarkup(inline_keyboard=buttons)

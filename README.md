@@ -23,11 +23,18 @@
 
 ### 2. Настроить конфиг
 
-Откройте `config.py` и укажите:
+В `config.py` укажите `MAIN_ADMIN_ID`:
 
 ```python
-BOT_TOKEN = "123456789:ABCdefGHIjklMNOpqrsTUVwxyz"  # токен от BotFather
 MAIN_ADMIN_ID = 123456789  # ваш Telegram ID
+```
+
+Токен передаётся через локальную переменную окружения `API_TOKEN`.
+
+PowerShell:
+
+```powershell
+$env:API_TOKEN="123456789:ABCdefGHIjklMNOpqrsTUVwxyz"
 ```
 
 Узнать свой Telegram ID можно у @userinfobot.

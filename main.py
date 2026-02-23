@@ -8,7 +8,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 
-from config import BOT_TOKEN
+from config import API_TOKEN
 from handlers import router
 from database import init_db, get_all_objects, get_object_by_id, get_calendar_data_for_api
 
@@ -107,9 +107,10 @@ async def start_api():
 
 async def main():
     # Проверка токена
-    if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
-        logger.error("⛔ Укажите BOT_TOKEN в файле config.py!")
-        logger.error("   Получите токен у @BotFather в Telegram")
+    if not API_TOKEN:
+        logger.error("⛔ Не задана переменная окружения API_TOKEN!")
+        logger.error("   Пример PowerShell: $env:API_TOKEN='ВАШ_ТОКЕН'")
+        logger.error("   Токен получите у @BotFather в Telegram")
         return
 
     # Инициализация БД
@@ -118,7 +119,7 @@ async def main():
 
     # Создаем бота и диспетчер
     bot = Bot(
-        token=BOT_TOKEN,
+        token=API_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML)
     )
     dp = Dispatcher()

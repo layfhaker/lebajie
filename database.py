@@ -29,6 +29,15 @@ def init_db():
         )
     ''')
 
+    # Настройки админов
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS admin_settings (
+            user_id INTEGER PRIMARY KEY,
+            notifications_enabled INTEGER NOT NULL DEFAULT 1,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+
     # Таблица FAQ
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS faq (
@@ -96,10 +105,34 @@ def init_db():
         ON bookings(object_id, date, status)
     ''')
 
+    # Таблица ручных блокировок дат (занято без пользовательской заявки)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS object_manual_blocks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            object_id INTEGER NOT NULL,
+            date TEXT NOT NULL,
+            admin_id INTEGER NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(object_id, date),
+            FOREIGN KEY (object_id) REFERENCES objects(id)
+        )
+    ''')
+
+    cursor.execute('''
+        CREATE INDEX IF NOT EXISTS idx_object_manual_blocks_object_date
+        ON object_manual_blocks(object_id, date)
+    ''')
+
     # Добавляем главного админа если его нет
     cursor.execute('SELECT user_id FROM admins WHERE user_id = ?', (MAIN_ADMIN_ID,))
     if not cursor.fetchone():
         cursor.execute('INSERT INTO admins (user_id, added_by) VALUES (?, ?)', (MAIN_ADMIN_ID, MAIN_ADMIN_ID))
+
+    # Гарантируем настройки главного админа
+    cursor.execute(
+        'INSERT OR IGNORE INTO admin_settings (user_id, notifications_enabled) VALUES (?, 1)',
+        (MAIN_ADMIN_ID,)
+    )
 
     # Добавляем FAQ по умолчанию если таблица пустая
     cursor.execute('SELECT COUNT(*) FROM faq')
@@ -214,10 +247,55 @@ def remove_admin(user_id):
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute('DELETE FROM admins WHERE user_id = ?', (user_id,))
-    conn.commit()
     affected = cursor.rowcount
+    cursor.execute('DELETE FROM admin_settings WHERE user_id = ?', (user_id,))
+    conn.commit()
     conn.close()
     return affected > 0
+
+
+def get_admin_notifications_enabled(user_id):
+    """Флаг уведомлений для админа. По умолчанию включены."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        'SELECT notifications_enabled FROM admin_settings WHERE user_id = ?',
+        (user_id,)
+    )
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return True
+    return bool(row['notifications_enabled'])
+
+
+def set_admin_notifications_enabled(user_id, enabled):
+    """Включить/выключить уведомления админа."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        '''INSERT INTO admin_settings (user_id, notifications_enabled, updated_at)
+           VALUES (?, ?, CURRENT_TIMESTAMP)
+           ON CONFLICT(user_id) DO UPDATE SET
+               notifications_enabled = excluded.notifications_enabled,
+               updated_at = CURRENT_TIMESTAMP''',
+        (user_id, 1 if enabled else 0)
+    )
+    conn.commit()
+    conn.close()
+    return True
+
+
+def toggle_admin_notifications(user_id):
+    """Переключить флаг уведомлений админа. Возвращает новое состояние."""
+    new_value = not get_admin_notifications_enabled(user_id)
+    set_admin_notifications_enabled(user_id, new_value)
+    return new_value
+
+
+def get_admins_for_notifications():
+    """Список админов, которым разрешены входящие уведомления."""
+    return [admin_id for admin_id in get_admins() if get_admin_notifications_enabled(admin_id)]
 
 # === FAQ ===
 
@@ -250,6 +328,32 @@ def add_faq(question, answer):
     faq_id = cursor.lastrowid
     conn.close()
     return faq_id
+
+
+def update_faq(faq_id, question=None, answer=None):
+    """Обновить вопрос и/или ответ FAQ"""
+    fields = []
+    values = []
+
+    if question is not None:
+        fields.append("question = ?")
+        values.append(question)
+    if answer is not None:
+        fields.append("answer = ?")
+        values.append(answer)
+
+    if not fields:
+        return False
+
+    values.append(faq_id)
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(f"UPDATE faq SET {', '.join(fields)} WHERE id = ?", values)
+    conn.commit()
+    affected = cursor.rowcount
+    conn.close()
+    return affected > 0
 
 
 def remove_faq(faq_id):
@@ -392,6 +496,47 @@ def deactivate_object(object_id):
 
 # === Бронирования ===
 
+def is_manual_blocked(object_id, date_str):
+    """Проверить, заблокирована ли дата вручную админом"""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT 1 FROM object_manual_blocks WHERE object_id = ? AND date = ?",
+        (object_id, date_str)
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return row is not None
+
+
+def toggle_object_manual_block(object_id, date_str, admin_id):
+    """Переключить ручную блокировку даты. Возвращает 'blocked' или 'unblocked'."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT id FROM object_manual_blocks WHERE object_id = ? AND date = ?",
+        (object_id, date_str)
+    )
+    row = cursor.fetchone()
+
+    if row:
+        cursor.execute(
+            "DELETE FROM object_manual_blocks WHERE object_id = ? AND date = ?",
+            (object_id, date_str)
+        )
+        conn.commit()
+        conn.close()
+        return 'unblocked'
+
+    cursor.execute(
+        "INSERT INTO object_manual_blocks (object_id, date, admin_id) VALUES (?, ?, ?)",
+        (object_id, date_str, admin_id)
+    )
+    conn.commit()
+    conn.close()
+    return 'blocked'
+
+
 def get_bookings_for_object_month(object_id, year, month):
     """Получить все активные бронирования объекта за месяц"""
     date_from = f"{year:04d}-{month:02d}-01"
@@ -406,16 +551,35 @@ def get_bookings_for_object_month(object_id, year, month):
         (object_id, date_from, date_to)
     )
     items = [dict(row) for row in cursor.fetchall()]
+
+    cursor.execute(
+        "SELECT date FROM object_manual_blocks WHERE object_id = ? AND date >= ? AND date < ? ORDER BY date",
+        (object_id, date_from, date_to)
+    )
+    for row in cursor.fetchall():
+        items.append({
+            "object_id": object_id,
+            "date": row["date"],
+            "status": "blocked",
+        })
+
     conn.close()
+    items.sort(key=lambda item: item["date"])
     return items
 
 
 def get_day_status(object_id, date_str):
     """Статус дня: 'available', 'pending' или 'booked'"""
+    if is_manual_blocked(object_id, date_str):
+        return 'booked'
+
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT status FROM bookings WHERE object_id = ? AND date = ? AND status != 'cancelled'",
+        """SELECT status FROM bookings
+           WHERE object_id = ? AND date = ? AND status != 'cancelled'
+           ORDER BY CASE status WHEN 'confirmed' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END
+           LIMIT 1""",
         (object_id, date_str)
     )
     row = cursor.fetchone()
@@ -430,6 +594,14 @@ def create_booking(object_id, date_str, user_id, user_name, user_phone):
     conn = get_connection()
     cursor = conn.cursor()
     # Проверяем доступность в одной транзакции
+    cursor.execute(
+        "SELECT id FROM object_manual_blocks WHERE object_id = ? AND date = ?",
+        (object_id, date_str)
+    )
+    if cursor.fetchone():
+        conn.close()
+        return None
+
     cursor.execute(
         "SELECT id FROM bookings WHERE object_id = ? AND date = ? AND status != 'cancelled'",
         (object_id, date_str)
@@ -539,7 +711,7 @@ def get_calendar_data_for_api(object_id, year, month):
     bookings = get_bookings_for_object_month(object_id, year, month)
     booking_map = {}
     for b in bookings:
-        if b['status'] == 'confirmed':
+        if b['status'] in ('confirmed', 'blocked'):
             booking_map[b['date']] = 'booked'
         elif b['date'] not in booking_map:
             booking_map[b['date']] = 'partially'

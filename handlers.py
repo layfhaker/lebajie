@@ -9,14 +9,15 @@ from datetime import date, datetime
 import keyboards as kb
 from database import (
     is_admin, get_admins, add_admin, remove_admin,
-    get_faq, get_faq_by_id, add_faq, remove_faq,
+    get_admins_for_notifications, get_admin_notifications_enabled, toggle_admin_notifications,
+    get_faq, get_faq_by_id, add_faq, update_faq, remove_faq,
     generate_ref_token, use_ref_token,
     set_user_in_support, is_user_in_support,
     get_objects_by_category, get_object_by_id, get_all_objects_admin,
     get_bookings_for_object_month, get_day_status, create_booking,
     confirm_booking, reject_booking, cancel_booking,
     get_booking_by_id, get_pending_bookings,
-    update_object,
+    update_object, is_manual_blocked, toggle_object_manual_block,
 )
 from config import MAIN_ADMIN_ID
 
@@ -44,6 +45,8 @@ SITE_START_CATEGORY_MAP = {
 class AdminStates(StatesGroup):
     waiting_faq_question = State()
     waiting_faq_answer = State()
+    editing_faq_question = State()
+    editing_faq_answer = State()
     waiting_reply_to_user = State()
 
 class UserStates(StatesGroup):
@@ -53,6 +56,29 @@ class BookingStates(StatesGroup):
     entering_name = State()
     entering_phone = State()
     confirming = State()
+
+
+def get_admin_panel_keyboard(user_id):
+    """Клавиатура админ-панели с учетом роли и уведомлений."""
+    is_tech_admin = user_id == MAIN_ADMIN_ID
+    notifications_enabled = get_admin_notifications_enabled(user_id) if is_tech_admin else True
+    return kb.get_admin_keyboard(
+        is_tech_admin=is_tech_admin,
+        notifications_enabled=notifications_enabled
+    )
+
+
+def get_admin_panel_text(user_id):
+    """Текст админ-панели с информацией для админ-технаря."""
+    text = "🔧 <b>Админ-панель</b>\n\nВыберите действие:"
+    if user_id == MAIN_ADMIN_ID:
+        notifications_enabled = get_admin_notifications_enabled(user_id)
+        status_text = "включены" if notifications_enabled else "выключены"
+        text += (
+            "\n\n🛠 Роль: <b>админ-технарь</b>"
+            f"\n🔔 Уведомления: <b>{status_text}</b>"
+        )
+    return text
 
 # === Стартовые команды ===
 
@@ -114,8 +140,8 @@ async def cmd_admin(message: Message):
         return
 
     await message.answer(
-        "🔧 <b>Админ-панель</b>\n\nВыберите действие:",
-        reply_markup=kb.get_admin_keyboard(),
+        get_admin_panel_text(message.from_user.id),
+        reply_markup=get_admin_panel_keyboard(message.from_user.id),
         parse_mode="HTML"
     )
 
@@ -218,7 +244,7 @@ async def callback_support_end(callback: CallbackQuery, state: FSMContext):
 @router.message(UserStates.in_support)
 async def handle_support_message(message: Message, state: FSMContext):
     """Пересылка сообщения от пользователя админам"""
-    admins = get_admins()
+    admins = get_admins_for_notifications()
 
     user = message.from_user
     user_info = "👤 <b>Сообщение от пользователя</b>\n"
@@ -311,12 +337,41 @@ async def callback_admin_panel(callback: CallbackQuery):
         return
 
     await callback.message.edit_text(
-        "🔧 <b>Админ-панель</b>\n\nВыберите действие:",
-        reply_markup=kb.get_admin_keyboard(),
+        get_admin_panel_text(callback.from_user.id),
+        reply_markup=get_admin_panel_keyboard(callback.from_user.id),
+        parse_mode="HTML"
+    )
+
+
+@router.callback_query(F.data == "admin_toggle_notifications")
+async def callback_admin_toggle_notifications(callback: CallbackQuery):
+    """Включить/выключить уведомления для админ-технаря"""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Нет доступа", show_alert=True)
+        return
+    if callback.from_user.id != MAIN_ADMIN_ID:
+        await callback.answer("⛔ Только админ-технарь может менять эту настройку", show_alert=True)
+        return
+
+    notifications_enabled = toggle_admin_notifications(callback.from_user.id)
+    status_text = "включены" if notifications_enabled else "выключены"
+    await callback.answer(f"Уведомления {status_text}", show_alert=True)
+
+    await callback.message.edit_text(
+        get_admin_panel_text(callback.from_user.id),
+        reply_markup=get_admin_panel_keyboard(callback.from_user.id),
         parse_mode="HTML"
     )
 
 # === Админ: Управление FAQ ===
+
+def build_admin_faq_item_text(item):
+    """Текст карточки FAQ-элемента в админке"""
+    return (
+        f"📝 <b>Редактирование FAQ #{item['id']}</b>\n\n"
+        f"❓ <b>Вопрос:</b>\n{item['question']}\n\n"
+        f"💬 <b>Ответ:</b>\n{item['answer']}"
+    )
 
 @router.callback_query(F.data == "admin_faq")
 async def callback_admin_faq(callback: CallbackQuery, state: FSMContext):
@@ -329,22 +384,151 @@ async def callback_admin_faq(callback: CallbackQuery, state: FSMContext):
     faq_list = get_faq()
     await callback.message.edit_text(
         "📝 <b>Управление FAQ</b>\n\n"
-        "Нажмите на вопрос для просмотра, или 🗑 для удаления.",
+        "Нажмите на вопрос, чтобы открыть меню редактирования.",
         reply_markup=kb.get_admin_faq_keyboard(faq_list),
         parse_mode="HTML"
     )
 
 @router.callback_query(F.data.startswith("admin_faq_view_"))
-async def callback_admin_faq_view(callback: CallbackQuery):
-    """Просмотр FAQ в админке"""
+async def callback_admin_faq_view(callback: CallbackQuery, state: FSMContext):
+    """Открыть меню редактирования FAQ"""
+    await state.clear()
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Нет доступа", show_alert=True)
+        return
+
     faq_id = int(callback.data.replace("admin_faq_view_", ""))
     item = get_faq_by_id(faq_id)
 
     if item:
-        await callback.answer(
-            f"Q: {item['question'][:100]}\n\nA: {item['answer'][:100]}",
-            show_alert=True
+        await callback.message.edit_text(
+            build_admin_faq_item_text(item),
+            reply_markup=kb.get_admin_faq_item_keyboard(faq_id),
+            parse_mode="HTML"
         )
+    else:
+        await callback.answer("Вопрос не найден", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("admin_faq_edit_q_"))
+async def callback_admin_faq_edit_question(callback: CallbackQuery, state: FSMContext):
+    """Изменить текст вопроса FAQ"""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Нет доступа", show_alert=True)
+        return
+
+    faq_id = int(callback.data.replace("admin_faq_edit_q_", ""))
+    item = get_faq_by_id(faq_id)
+    if not item:
+        await callback.answer("Вопрос не найден", show_alert=True)
+        return
+
+    await state.set_state(AdminStates.editing_faq_question)
+    await state.update_data(edit_faq_id=faq_id)
+    await callback.message.edit_text(
+        "✏️ <b>Редактирование вопроса</b>\n\n"
+        f"Текущий вопрос:\n{item['question']}\n\n"
+        "Отправьте новый текст вопроса.",
+        reply_markup=kb.get_cancel_keyboard(),
+        parse_mode="HTML"
+    )
+
+
+@router.callback_query(F.data.startswith("admin_faq_edit_a_"))
+async def callback_admin_faq_edit_answer(callback: CallbackQuery, state: FSMContext):
+    """Изменить текст ответа FAQ"""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Нет доступа", show_alert=True)
+        return
+
+    faq_id = int(callback.data.replace("admin_faq_edit_a_", ""))
+    item = get_faq_by_id(faq_id)
+    if not item:
+        await callback.answer("Вопрос не найден", show_alert=True)
+        return
+
+    await state.set_state(AdminStates.editing_faq_answer)
+    await state.update_data(edit_faq_id=faq_id)
+    await callback.message.edit_text(
+        "📝 <b>Редактирование ответа</b>\n\n"
+        f"Вопрос:\n{item['question']}\n\n"
+        f"Текущий ответ:\n{item['answer']}\n\n"
+        "Отправьте новый текст ответа.",
+        reply_markup=kb.get_cancel_keyboard(),
+        parse_mode="HTML"
+    )
+
+
+@router.message(AdminStates.editing_faq_question)
+async def handle_admin_edit_faq_question(message: Message, state: FSMContext):
+    """Сохранить новый текст вопроса FAQ"""
+    text = (message.text or "").strip()
+    if not text:
+        await message.answer("Введите текст вопроса.")
+        return
+
+    state_data = await state.get_data()
+    faq_id = state_data.get("edit_faq_id")
+    if not faq_id:
+        await state.clear()
+        await message.answer("❌ Ошибка состояния. Откройте FAQ заново.")
+        return
+
+    if not update_faq(faq_id, question=text):
+        await message.answer("❌ Не удалось обновить вопрос.")
+        return
+
+    await state.clear()
+    item = get_faq_by_id(faq_id)
+    if not item:
+        await message.answer("❌ Вопрос не найден.")
+        return
+
+    await message.answer(
+        "✅ Вопрос обновлён.",
+        parse_mode="HTML"
+    )
+    await message.answer(
+        build_admin_faq_item_text(item),
+        reply_markup=kb.get_admin_faq_item_keyboard(faq_id),
+        parse_mode="HTML"
+    )
+
+
+@router.message(AdminStates.editing_faq_answer)
+async def handle_admin_edit_faq_answer(message: Message, state: FSMContext):
+    """Сохранить новый текст ответа FAQ"""
+    text = (message.text or "").strip()
+    if not text:
+        await message.answer("Введите текст ответа.")
+        return
+
+    state_data = await state.get_data()
+    faq_id = state_data.get("edit_faq_id")
+    if not faq_id:
+        await state.clear()
+        await message.answer("❌ Ошибка состояния. Откройте FAQ заново.")
+        return
+
+    if not update_faq(faq_id, answer=text):
+        await message.answer("❌ Не удалось обновить ответ.")
+        return
+
+    await state.clear()
+    item = get_faq_by_id(faq_id)
+    if not item:
+        await message.answer("❌ Вопрос не найден.")
+        return
+
+    await message.answer(
+        "✅ Ответ обновлён.",
+        parse_mode="HTML"
+    )
+    await message.answer(
+        build_admin_faq_item_text(item),
+        reply_markup=kb.get_admin_faq_item_keyboard(faq_id),
+        parse_mode="HTML"
+    )
 
 @router.callback_query(F.data.startswith("admin_faq_delete_"))
 async def callback_admin_faq_delete(callback: CallbackQuery):
@@ -378,7 +562,7 @@ async def callback_admin_faq_confirm_delete(callback: CallbackQuery):
         faq_list = get_faq()
         await callback.message.edit_text(
             "📝 <b>Управление FAQ</b>\n\n"
-            "Нажмите на вопрос для просмотра, или 🗑 для удаления.",
+            "Нажмите на вопрос, чтобы открыть меню редактирования.",
             reply_markup=kb.get_admin_faq_keyboard(faq_list),
             parse_mode="HTML"
         )
@@ -425,7 +609,7 @@ async def handle_faq_answer(message: Message, state: FSMContext):
         "✅ <b>FAQ добавлен!</b>\n\n"
         f"❓ {question}\n\n"
         f"💬 {message.text}",
-        reply_markup=kb.get_admin_keyboard(),
+        reply_markup=get_admin_panel_keyboard(message.from_user.id),
         parse_mode="HTML"
     )
 
@@ -442,7 +626,7 @@ async def callback_admin_admins(callback: CallbackQuery):
     await callback.message.edit_text(
         "👥 <b>Управление администраторами</b>\n\n"
         f"Всего админов: {len(admins)}\n"
-        "★ — главный админ (нельзя удалить)",
+        "★ — админ-технарь (главный, нельзя удалить)",
         reply_markup=kb.get_admin_admins_keyboard(admins, MAIN_ADMIN_ID),
         parse_mode="HTML"
     )
@@ -496,7 +680,7 @@ async def callback_admin_create_ref(callback: CallbackQuery):
         f"<code>{ref_link}</code>\n\n"
         "Отправьте эту ссылку человеку, которого хотите сделать админом.\n"
         "⚠️ Ссылка одноразовая.",
-        reply_markup=kb.get_admin_keyboard(),
+        reply_markup=get_admin_panel_keyboard(callback.from_user.id),
         parse_mode="HTML"
     )
 
@@ -721,7 +905,7 @@ async def callback_booking_confirm(callback: CallbackQuery, state: FSMContext):
     )
 
     # Уведомляем админов
-    admins = get_admins()
+    admins = get_admins_for_notifications()
     admin_text = (
         "🔔 <b>Новая заявка на бронирование!</b>\n\n"
         f"#{booking_id}\n"
@@ -938,6 +1122,31 @@ async def callback_admin_book_cancel(callback: CallbackQuery):
 
 # === Админ: Управление объектами ===
 
+async def render_admin_object_calendar(message, obj, year, month):
+    """Отрисовать календарь объекта для админки"""
+    bookings = get_bookings_for_object_month(obj['id'], year, month)
+
+    price_text = f"{obj['price_weekday']}₽/день"
+    if obj['price_weekday'] != obj['price_weekend']:
+        price_text = f"{obj['price_weekday']}₽ будни / {obj['price_weekend']}₽ выходные"
+
+    active_text = "🟢 активен" if obj['is_active'] else "🔴 отключён"
+
+    await message.edit_text(
+        f"📅 <b>{obj['name']}</b>\n"
+        f"👥 До {obj['capacity']} человек | {price_text}\n"
+        f"Статус объекта: {active_text}\n\n"
+        "Нажмите на день, чтобы отметить занятость или снять ручную блокировку.",
+        reply_markup=kb.get_admin_object_calendar_keyboard(
+            object_id=obj['id'],
+            year=year,
+            month=month,
+            bookings=bookings,
+            is_active=obj['is_active'],
+        ),
+        parse_mode="HTML"
+    )
+
 @router.callback_query(F.data == "admin_objects")
 async def callback_admin_objects(callback: CallbackQuery):
     """Список объектов для управления"""
@@ -948,30 +1157,133 @@ async def callback_admin_objects(callback: CallbackQuery):
     await callback.message.edit_text(
         "🔧 <b>Управление объектами</b>\n\n"
         "🟢 активен | 🔴 отключён\n"
-        "Нажмите для переключения:",
+        "Нажмите на объект, чтобы открыть календарь занятости:",
         reply_markup=kb.get_admin_objects_keyboard(objects),
         parse_mode="HTML"
     )
 
-@router.callback_query(F.data.startswith("admin_obj_toggle_"))
-async def callback_admin_obj_toggle(callback: CallbackQuery):
-    """Включить/отключить объект"""
+@router.callback_query(F.data.startswith("admin_obj_open_"))
+async def callback_admin_obj_open(callback: CallbackQuery):
+    """Открыть календарь объекта в админке"""
     if not is_admin(callback.from_user.id):
         await callback.answer("⛔ Нет доступа", show_alert=True)
         return
+
+    object_id = int(callback.data.replace("admin_obj_open_", ""))
+    obj = get_object_by_id(object_id)
+    if not obj:
+        await callback.answer("Объект не найден", show_alert=True)
+        return
+
+    today = date.today()
+    await render_admin_object_calendar(callback.message, obj, today.year, today.month)
+
+
+@router.callback_query(F.data.startswith("admin_obj_cal_"))
+async def callback_admin_obj_calendar_nav(callback: CallbackQuery):
+    """Навигация календаря объекта в админке"""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Нет доступа", show_alert=True)
+        return
+
+    payload = callback.data.replace("admin_obj_cal_", "", 1)
+    object_id_str, year_str, month_str = payload.split("_", 2)
+    object_id = int(object_id_str)
+    year = int(year_str)
+    month = int(month_str)
+
+    obj = get_object_by_id(object_id)
+    if not obj:
+        await callback.answer("Объект не найден", show_alert=True)
+        return
+
+    await render_admin_object_calendar(callback.message, obj, year, month)
+
+
+@router.callback_query(F.data.startswith("admin_obj_day_"))
+async def callback_admin_obj_day_toggle(callback: CallbackQuery):
+    """Переключить ручную блокировку даты объекта"""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Нет доступа", show_alert=True)
+        return
+
+    payload = callback.data.replace("admin_obj_day_", "", 1)
+    object_id_str, date_str = payload.split("_", 1)
+    object_id = int(object_id_str)
+
+    obj = get_object_by_id(object_id)
+    if not obj:
+        await callback.answer("Объект не найден", show_alert=True)
+        return
+
+    day_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+    if day_date < date.today():
+        await callback.answer("Прошедшие даты редактировать нельзя", show_alert=True)
+        return
+
+    status = get_day_status(object_id, date_str)
+    manual_block = is_manual_blocked(object_id, date_str)
+
+    if status == 'pending':
+        await callback.answer("На эту дату есть ожидающая заявка", show_alert=True)
+        return
+    if status == 'booked' and not manual_block:
+        await callback.answer("Дата занята подтверждённым бронированием", show_alert=True)
+        return
+
+    result = toggle_object_manual_block(object_id, date_str, callback.from_user.id)
+    if result == 'blocked':
+        await callback.answer("Дата отмечена как занята", show_alert=True)
+    elif result == 'unblocked':
+        await callback.answer("Ручная блокировка снята", show_alert=True)
+
+    await render_admin_object_calendar(callback.message, obj, day_date.year, day_date.month)
+
+
+@router.callback_query(F.data.startswith("admin_obj_active_"))
+async def callback_admin_obj_active_toggle(callback: CallbackQuery):
+    """Включить/отключить объект из календаря"""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Нет доступа", show_alert=True)
+        return
+
+    payload = callback.data.replace("admin_obj_active_", "", 1)
+    object_id_str, year_str, month_str = payload.split("_", 2)
+    object_id = int(object_id_str)
+    year = int(year_str)
+    month = int(month_str)
+
+    obj = get_object_by_id(object_id)
+    if not obj:
+        await callback.answer("Объект не найден", show_alert=True)
+        return
+
+    new_status = 0 if obj['is_active'] else 1
+    if update_object(object_id, is_active=new_status):
+        await callback.answer("Статус объекта обновлён", show_alert=True)
+    else:
+        await callback.answer("Не удалось обновить статус объекта", show_alert=True)
+
+    updated_obj = get_object_by_id(object_id)
+    if not updated_obj:
+        await callback.answer("Объект не найден", show_alert=True)
+        return
+
+    await render_admin_object_calendar(callback.message, updated_obj, year, month)
+
+
+@router.callback_query(F.data.startswith("admin_obj_toggle_"))
+async def callback_admin_obj_toggle_legacy(callback: CallbackQuery):
+    """Совместимость со старыми сообщениями: открыть календарь объекта"""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Нет доступа", show_alert=True)
+        return
+
     object_id = int(callback.data.replace("admin_obj_toggle_", ""))
     obj = get_object_by_id(object_id)
-    if obj:
-        new_status = 0 if obj['is_active'] else 1
-        update_object(object_id, is_active=new_status)
-        status_text = "включён" if new_status else "отключён"
-        await callback.answer(f"Объект {status_text}", show_alert=True)
-    # Обновляем список
-    objects = get_all_objects_admin()
-    await callback.message.edit_text(
-        "🔧 <b>Управление объектами</b>\n\n"
-        "🟢 активен | 🔴 отключён\n"
-        "Нажмите для переключения:",
-        reply_markup=kb.get_admin_objects_keyboard(objects),
-        parse_mode="HTML"
-    )
+    if not obj:
+        await callback.answer("Объект не найден", show_alert=True)
+        return
+
+    today = date.today()
+    await render_admin_object_calendar(callback.message, obj, today.year, today.month)
