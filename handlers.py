@@ -42,6 +42,13 @@ SITE_START_CATEGORY_MAP = {
     "gazebo_recreation": "gazebo_recreation",
 }
 
+GIFT_CERTIFICATE_MENU_TEXT = (
+    "🎁 <b>Подарочный сертификат</b>\n\n"
+    "Подарочный сертификат можно оформить на услуги отдыха и рыбалки на Лебяжьем озере.\n"
+    "Наполнение сертификата подбирается индивидуально, в зависимости от ваших пожеланий.\n\n"
+    "Нажмите кнопку ниже, чтобы оставить обращение администратору."
+)
+
 SUPPORT_TOPICS = {
     "general": {
         "label": "Общая поддержка",
@@ -184,6 +191,14 @@ async def cmd_start(message: Message, state: FSMContext):
                 f"📅 <b>{BOOKING_CATEGORY_NAMES.get(start_category, 'Бронирование')}</b>\n\n"
                 "Выберите объект:",
                 reply_markup=kb.get_booking_objects_keyboard(objects, start_category),
+                parse_mode="HTML"
+            )
+            return
+
+        if start_arg_normalized == "site_gift_certificate":
+            await message.answer(
+                GIFT_CERTIFICATE_MENU_TEXT,
+                reply_markup=kb.get_gift_certificate_keyboard(),
                 parse_mode="HTML"
             )
             return
@@ -331,10 +346,7 @@ async def callback_gift_certificate_menu(callback: CallbackQuery, state: FSMCont
     set_user_in_support(callback.from_user.id, False)
 
     await callback.message.edit_text(
-        "🎁 <b>Подарочный сертификат</b>\n\n"
-        "Подарочный сертификат можно оформить на услуги отдыха и рыбалки на Лебяжьем озере.\n"
-        "Наполнение сертификата подбирается индивидуально, в зависимости от ваших пожеланий.\n\n"
-        "Нажмите кнопку ниже, чтобы оставить обращение администратору.",
+        GIFT_CERTIFICATE_MENU_TEXT,
         reply_markup=kb.get_gift_certificate_keyboard(),
         parse_mode="HTML"
     )
