@@ -485,11 +485,17 @@ async def callback_admin_panel(callback: CallbackQuery):
         await callback.answer("⛔ Нет доступа", show_alert=True)
         return
 
-    await callback.message.edit_text(
-        get_admin_panel_text(callback.from_user.id),
-        reply_markup=get_admin_panel_keyboard(callback.from_user.id),
-        parse_mode="HTML"
-    )
+    try:
+        await callback.message.edit_text(
+            get_admin_panel_text(callback.from_user.id),
+            reply_markup=get_admin_panel_keyboard(callback.from_user.id),
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        if "message is not modified" in str(e):
+            await callback.answer()
+            return
+        raise
 
 
 @router.callback_query(F.data == "admin_toggle_notifications")
