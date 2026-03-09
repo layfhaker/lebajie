@@ -7,6 +7,7 @@ def get_main_keyboard(is_admin_user=False):
     buttons = [
         [InlineKeyboardButton(text="❓ Частые вопросы (FAQ)", callback_data="faq_menu")],
         [InlineKeyboardButton(text="📅 Бронирование", callback_data="booking")],
+        [InlineKeyboardButton(text="🎁 Подарочный сертификат", callback_data="gift_certificate_menu")],
         [InlineKeyboardButton(text="💬 Связаться с поддержкой", callback_data="support_start")],
     ]
     if is_admin_user:
@@ -40,6 +41,14 @@ def get_support_keyboard():
     ])
     return keyboard
 
+def get_gift_certificate_keyboard():
+    """Раздел подарочных сертификатов"""
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📝 Оставить заявку на сертификат", callback_data="gift_certificate_support")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_main")],
+    ])
+    return keyboard
+
 def get_back_keyboard():
     """Кнопка назад"""
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -49,7 +58,7 @@ def get_back_keyboard():
 
 # === Админские клавиатуры ===
 
-def get_admin_keyboard(is_tech_admin=False, notifications_enabled=True):
+def get_admin_keyboard(notifications_enabled=True):
     """Админ-панель"""
     buttons = [
         [InlineKeyboardButton(text="📅 Бронирования", callback_data="admin_bookings")],
@@ -58,9 +67,8 @@ def get_admin_keyboard(is_tech_admin=False, notifications_enabled=True):
         [InlineKeyboardButton(text="👥 Управление админами", callback_data="admin_admins")],
     ]
 
-    if is_tech_admin:
-        toggle_text = "🔕 Выключить уведомления" if notifications_enabled else "🔔 Включить уведомления"
-        buttons.append([InlineKeyboardButton(text=toggle_text, callback_data="admin_toggle_notifications")])
+    toggle_text = "🔕 Выключить уведомления" if notifications_enabled else "🔔 Включить уведомления"
+    buttons.append([InlineKeyboardButton(text=toggle_text, callback_data="admin_toggle_notifications")])
 
     buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_main")])
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)

@@ -5,11 +5,12 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
 from datetime import date, datetime
+from html import escape
 
 import keyboards as kb
 from database import (
     is_admin, get_admins, add_admin, remove_admin,
-    get_admins_for_notifications, get_admin_notifications_enabled, toggle_admin_notifications,
+    get_admins_for_notifications, get_global_notifications_enabled, toggle_global_notifications,
     get_faq, get_faq_by_id, add_faq, update_faq, remove_faq,
     generate_ref_token, use_ref_token,
     set_user_in_support, is_user_in_support,
@@ -41,6 +42,43 @@ SITE_START_CATEGORY_MAP = {
     "gazebo_recreation": "gazebo_recreation",
 }
 
+SUPPORT_TOPICS = {
+    "general": {
+        "label": "Общая поддержка",
+        "intro_text": (
+            "💬 <b>Связь с поддержкой</b>\n\n"
+            "Напишите ваш вопрос, и мы ответим вам в ближайшее время.\n\n"
+            "Можете отправлять текст, фото или документы."
+        ),
+        "sent_text": (
+            "✅ Ваше сообщение отправлено в поддержку.\n"
+            "Ожидайте ответа."
+        ),
+        "disabled_text": (
+            "⚠️ Уведомления поддержки сейчас отключены.\n"
+            "Сообщение не было отправлено администраторам. Попробуйте позже."
+        ),
+        "admin_title": "💬 <b>Новое обращение в поддержку</b>",
+    },
+    "gift_certificate": {
+        "label": "Подарочный сертификат",
+        "intro_text": (
+            "🎁 <b>Заявка на подарочный сертификат</b>\n\n"
+            "Напишите, какой сертификат вас интересует, и администратор свяжется с вами для уточнения деталей.\n\n"
+            "Можете отправлять текст, фото или документы."
+        ),
+        "sent_text": (
+            "✅ Ваша заявка на подарочный сертификат отправлена администратору.\n"
+            "Ожидайте ответа."
+        ),
+        "disabled_text": (
+            "⚠️ Уведомления по подарочным сертификатам сейчас отключены.\n"
+            "Заявка не была отправлена администраторам. Попробуйте позже."
+        ),
+        "admin_title": "🎁 <b>Новое обращение по подарочному сертификату</b>",
+    },
+}
+
 # === Состояния ===
 class AdminStates(StatesGroup):
     waiting_faq_question = State()
@@ -58,26 +96,60 @@ class BookingStates(StatesGroup):
     confirming = State()
 
 
-def get_admin_panel_keyboard(user_id):
-    """Клавиатура админ-панели с учетом роли и уведомлений."""
-    is_tech_admin = user_id == MAIN_ADMIN_ID
-    notifications_enabled = get_admin_notifications_enabled(user_id) if is_tech_admin else True
-    return kb.get_admin_keyboard(
-        is_tech_admin=is_tech_admin,
-        notifications_enabled=notifications_enabled
+def get_support_topic_config(topic):
+    """Вернуть конфигурацию сценария поддержки."""
+    return SUPPORT_TOPICS.get(topic, SUPPORT_TOPICS["general"])
+
+
+def get_message_preview(message: Message):
+    """Короткое описание содержимого сообщения для админа."""
+    if message.text:
+        return message.text
+    if message.caption:
+        return message.caption
+    if message.photo:
+        return "[фото]"
+    if message.document:
+        return "[документ]"
+    if message.video:
+        return "[видео]"
+    if message.voice:
+        return "[голосовое сообщение]"
+    if message.audio:
+        return "[аудио]"
+    if message.sticker:
+        return "[стикер]"
+    return "[медиа-сообщение]"
+
+
+async def start_support_dialog(callback: CallbackQuery, state: FSMContext, topic="general"):
+    """Запустить выбранный сценарий поддержки."""
+    topic_config = get_support_topic_config(topic)
+    await state.set_state(UserStates.in_support)
+    await state.update_data(support_type=topic)
+    set_user_in_support(callback.from_user.id, True)
+
+    await callback.message.edit_text(
+        topic_config["intro_text"],
+        reply_markup=kb.get_support_keyboard(),
+        parse_mode="HTML"
     )
 
 
+def get_admin_panel_keyboard(user_id):
+    """Клавиатура админ-панели с учетом глобального статуса уведомлений."""
+    notifications_enabled = get_global_notifications_enabled()
+    return kb.get_admin_keyboard(notifications_enabled=notifications_enabled)
+
+
 def get_admin_panel_text(user_id):
-    """Текст админ-панели с информацией для админ-технаря."""
+    """Текст админ-панели с информацией о глобальных уведомлениях."""
     text = "🔧 <b>Админ-панель</b>\n\nВыберите действие:"
+    notifications_enabled = get_global_notifications_enabled()
+    status_text = "включены" if notifications_enabled else "выключены"
+    text += f"\n\n🔔 Глобальные уведомления: <b>{status_text}</b>"
     if user_id == MAIN_ADMIN_ID:
-        notifications_enabled = get_admin_notifications_enabled(user_id)
-        status_text = "включены" if notifications_enabled else "выключены"
-        text += (
-            "\n\n🛠 Роль: <b>админ-технарь</b>"
-            f"\n🔔 Уведомления: <b>{status_text}</b>"
-        )
+        text += "\n🛠 Роль: <b>админ-технарь</b>"
     return text
 
 # === Стартовые команды ===
@@ -145,6 +217,44 @@ async def cmd_admin(message: Message):
         parse_mode="HTML"
     )
 
+@router.message(Command("add_admin"))
+async def cmd_add_admin(message: Message):
+    """Добавить администратора по Telegram ID."""
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ У вас нет доступа к этой команде.")
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer(
+            "Использование: <code>/add_admin 123456789</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    raw_user_id = parts[1].strip()
+    try:
+        user_id = int(raw_user_id)
+    except ValueError:
+        await message.answer("❌ Telegram ID должен быть числом.")
+        return
+
+    if user_id <= 0:
+        await message.answer("❌ Telegram ID должен быть положительным числом.")
+        return
+
+    if is_admin(user_id):
+        await message.answer(f"ℹ️ Пользователь <code>{user_id}</code> уже является администратором.", parse_mode="HTML")
+        return
+
+    if add_admin(user_id, message.from_user.id):
+        await message.answer(
+            f"✅ Пользователь <code>{user_id}</code> добавлен в администраторы.",
+            parse_mode="HTML"
+        )
+    else:
+        await message.answer("❌ Не удалось добавить администратора.")
+
 @router.message(Command("help"))
 async def cmd_help(message: Message):
     """Помощь"""
@@ -155,6 +265,7 @@ async def cmd_help(message: Message):
     )
     if is_admin(message.from_user.id):
         text += "/admin — Панель администратора\n"
+        text += "/add_admin ID — Добавить админа по Telegram ID\n"
 
     await message.answer(text, parse_mode="HTML")
 
@@ -213,19 +324,31 @@ async def callback_faq_answer(callback: CallbackQuery):
 
 # === Поддержка ===
 
+@router.callback_query(F.data == "gift_certificate_menu")
+async def callback_gift_certificate_menu(callback: CallbackQuery, state: FSMContext):
+    """Раздел подарочных сертификатов."""
+    await state.clear()
+    set_user_in_support(callback.from_user.id, False)
+
+    await callback.message.edit_text(
+        "🎁 <b>Подарочный сертификат</b>\n\n"
+        "Подарочный сертификат можно оформить на услуги отдыха и рыбалки на Лебяжьем озере.\n"
+        "Наполнение сертификата подбирается индивидуально, в зависимости от ваших пожеланий.\n\n"
+        "Нажмите кнопку ниже, чтобы оставить обращение администратору.",
+        reply_markup=kb.get_gift_certificate_keyboard(),
+        parse_mode="HTML"
+    )
+
 @router.callback_query(F.data == "support_start")
 async def callback_support_start(callback: CallbackQuery, state: FSMContext):
     """Начать диалог с поддержкой"""
-    await state.set_state(UserStates.in_support)
-    set_user_in_support(callback.from_user.id, True)
+    await start_support_dialog(callback, state, topic="general")
 
-    await callback.message.edit_text(
-        "💬 <b>Связь с поддержкой</b>\n\n"
-        "Напишите ваш вопрос, и мы ответим вам в ближайшее время.\n\n"
-        "Можете отправлять текст, фото или документы.",
-        reply_markup=kb.get_support_keyboard(),
-        parse_mode="HTML"
-    )
+
+@router.callback_query(F.data == "gift_certificate_support")
+async def callback_gift_certificate_support(callback: CallbackQuery, state: FSMContext):
+    """Начать диалог по подарочным сертификатам."""
+    await start_support_dialog(callback, state, topic="gift_certificate")
 
 @router.callback_query(F.data == "support_end")
 async def callback_support_end(callback: CallbackQuery, state: FSMContext):
@@ -244,22 +367,37 @@ async def callback_support_end(callback: CallbackQuery, state: FSMContext):
 @router.message(UserStates.in_support)
 async def handle_support_message(message: Message, state: FSMContext):
     """Пересылка сообщения от пользователя админам"""
+    state_data = await state.get_data()
+    support_type = state_data.get("support_type", "general")
+    topic_config = get_support_topic_config(support_type)
+
+    if not get_global_notifications_enabled():
+        await message.answer(
+            topic_config["disabled_text"],
+            reply_markup=kb.get_support_keyboard()
+        )
+        return
+
     admins = get_admins_for_notifications()
 
     user = message.from_user
-    user_info = "👤 <b>Сообщение от пользователя</b>\n"
-    user_info += f"ID: <code>{user.id}</code>\n"
-    user_info += f"Имя: {user.full_name}\n"
+    message_preview = escape(get_message_preview(message))
+    user_full_name = escape(user.full_name)
+
+    user_info = f"{topic_config['admin_title']}\n\n"
+    user_info += f"Тип обращения: <b>{topic_config['label']}</b>\n"
+    user_info += f"Пользователь: {user_full_name}\n"
     if user.username:
         user_info += f"Username: @{user.username}\n"
-    user_info += "\n"
+    user_info += f"Telegram ID: <code>{user.id}</code>\n"
+    user_info += f"Сообщение клиента: {message_preview}\n"
 
     # Отправляем всем админам
     for admin_id in admins:
         try:
             await message.bot.send_message(
                 admin_id,
-                user_info + "⬇️ <b>Сообщение:</b>",
+                user_info,
                 parse_mode="HTML"
             )
             # Пересылаем оригинальное сообщение
@@ -274,8 +412,7 @@ async def handle_support_message(message: Message, state: FSMContext):
             print(f"Не удалось отправить сообщение админу {admin_id}: {e}")
 
     await message.answer(
-        "✅ Ваше сообщение отправлено в поддержку.\n"
-        "Ожидайте ответа.",
+        topic_config["sent_text"],
         reply_markup=kb.get_support_keyboard()
     )
 
@@ -345,17 +482,14 @@ async def callback_admin_panel(callback: CallbackQuery):
 
 @router.callback_query(F.data == "admin_toggle_notifications")
 async def callback_admin_toggle_notifications(callback: CallbackQuery):
-    """Включить/выключить уведомления для админ-технаря"""
+    """Включить/выключить все автоматические уведомления бота."""
     if not is_admin(callback.from_user.id):
         await callback.answer("⛔ Нет доступа", show_alert=True)
         return
-    if callback.from_user.id != MAIN_ADMIN_ID:
-        await callback.answer("⛔ Только админ-технарь может менять эту настройку", show_alert=True)
-        return
 
-    notifications_enabled = toggle_admin_notifications(callback.from_user.id)
+    notifications_enabled = toggle_global_notifications()
     status_text = "включены" if notifications_enabled else "выключены"
-    await callback.answer(f"Уведомления {status_text}", show_alert=True)
+    await callback.answer(f"Глобальные уведомления {status_text}", show_alert=True)
 
     await callback.message.edit_text(
         get_admin_panel_text(callback.from_user.id),
@@ -1022,18 +1156,19 @@ async def callback_admin_book_confirm(callback: CallbackQuery):
                 parse_mode="HTML"
             )
             # Уведомляем пользователя
-            try:
-                await callback.bot.send_message(
-                    booking['user_id'],
-                    f"✅ <b>Ваше бронирование подтверждено!</b>\n\n"
-                    f"#{booking['id']}\n"
-                    f"🏠 {booking['object_name']}\n"
-                    f"📆 {booking['date']}\n\n"
-                    "Ждём вас!",
-                    parse_mode="HTML"
-                )
-            except Exception:
-                pass
+            if get_global_notifications_enabled():
+                try:
+                    await callback.bot.send_message(
+                        booking['user_id'],
+                        f"✅ <b>Ваше бронирование подтверждено!</b>\n\n"
+                        f"#{booking['id']}\n"
+                        f"🏠 {booking['object_name']}\n"
+                        f"📆 {booking['date']}\n\n"
+                        "Ждём вас!",
+                        parse_mode="HTML"
+                    )
+                except Exception:
+                    pass
     else:
         await callback.answer("❌ Не удалось подтвердить", show_alert=True)
 
@@ -1062,18 +1197,19 @@ async def callback_admin_book_reject(callback: CallbackQuery):
             )
         # Уведомляем пользователя
         if booking:
-            try:
-                await callback.bot.send_message(
-                    booking['user_id'],
-                    f"❌ <b>Ваше бронирование отклонено</b>\n\n"
-                    f"#{booking['id']}\n"
-                    f"🏠 {booking['object_name']}\n"
-                    f"📆 {booking['date']}\n\n"
-                    "Свяжитесь с поддержкой для уточнения.",
-                    parse_mode="HTML"
-                )
-            except Exception:
-                pass
+            if get_global_notifications_enabled():
+                try:
+                    await callback.bot.send_message(
+                        booking['user_id'],
+                        f"❌ <b>Ваше бронирование отклонено</b>\n\n"
+                        f"#{booking['id']}\n"
+                        f"🏠 {booking['object_name']}\n"
+                        f"📆 {booking['date']}\n\n"
+                        "Свяжитесь с поддержкой для уточнения.",
+                        parse_mode="HTML"
+                    )
+                except Exception:
+                    pass
     else:
         await callback.answer("❌ Ошибка", show_alert=True)
 
@@ -1105,18 +1241,19 @@ async def callback_admin_book_cancel(callback: CallbackQuery):
             )
         # Уведомляем пользователя
         if booking:
-            try:
-                await callback.bot.send_message(
-                    booking['user_id'],
-                    f"🚫 <b>Ваше бронирование отменено администратором</b>\n\n"
-                    f"#{booking['id']}\n"
-                    f"🏠 {booking['object_name']}\n"
-                    f"📆 {booking['date']}\n\n"
-                    "Свяжитесь с поддержкой для уточнения.",
-                    parse_mode="HTML"
-                )
-            except Exception:
-                pass
+            if get_global_notifications_enabled():
+                try:
+                    await callback.bot.send_message(
+                        booking['user_id'],
+                        f"🚫 <b>Ваше бронирование отменено администратором</b>\n\n"
+                        f"#{booking['id']}\n"
+                        f"🏠 {booking['object_name']}\n"
+                        f"📆 {booking['date']}\n\n"
+                        "Свяжитесь с поддержкой для уточнения.",
+                        parse_mode="HTML"
+                    )
+                except Exception:
+                    pass
     else:
         await callback.answer("❌ Ошибка", show_alert=True)
 

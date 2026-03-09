@@ -38,6 +38,15 @@ def init_db():
         )
     ''')
 
+    # Глобальные настройки бота
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS bot_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+
     # Таблица FAQ
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS faq (
@@ -132,6 +141,12 @@ def init_db():
     cursor.execute(
         'INSERT OR IGNORE INTO admin_settings (user_id, notifications_enabled) VALUES (?, 1)',
         (MAIN_ADMIN_ID,)
+    )
+
+    # Глобальная настройка уведомлений
+    cursor.execute(
+        'INSERT OR IGNORE INTO bot_settings (key, value) VALUES (?, ?)',
+        ('notifications_enabled', '1')
     )
 
     # Добавляем FAQ по умолчанию если таблица пустая
@@ -255,7 +270,7 @@ def remove_admin(user_id):
 
 
 def get_admin_notifications_enabled(user_id):
-    """Флаг уведомлений для админа. По умолчанию включены."""
+    """Флаг уведомлений для админа. Сохранено для совместимости."""
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
@@ -293,9 +308,50 @@ def toggle_admin_notifications(user_id):
     return new_value
 
 
+def get_global_notifications_enabled():
+    """Глобальный флаг уведомлений бота. По умолчанию включены."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        'SELECT value FROM bot_settings WHERE key = ?',
+        ('notifications_enabled',)
+    )
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return True
+    return row['value'] == '1'
+
+
+def set_global_notifications_enabled(enabled):
+    """Включить/выключить все автоматические уведомления бота."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        '''INSERT INTO bot_settings (key, value, updated_at)
+           VALUES (?, ?, CURRENT_TIMESTAMP)
+           ON CONFLICT(key) DO UPDATE SET
+               value = excluded.value,
+               updated_at = CURRENT_TIMESTAMP''',
+        ('notifications_enabled', '1' if enabled else '0')
+    )
+    conn.commit()
+    conn.close()
+    return True
+
+
+def toggle_global_notifications():
+    """Переключить глобальный флаг уведомлений. Возвращает новое состояние."""
+    new_value = not get_global_notifications_enabled()
+    set_global_notifications_enabled(new_value)
+    return new_value
+
+
 def get_admins_for_notifications():
     """Список админов, которым разрешены входящие уведомления."""
-    return [admin_id for admin_id in get_admins() if get_admin_notifications_enabled(admin_id)]
+    if not get_global_notifications_enabled():
+        return []
+    return get_admins()
 
 # === FAQ ===
 
